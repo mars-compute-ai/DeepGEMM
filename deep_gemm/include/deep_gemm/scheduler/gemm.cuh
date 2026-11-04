@@ -67,6 +67,9 @@ struct Scheduler {
     uint32_t current_group_idx = 0;
     // Only used for masked layout
     uint32_t current_m_cumsum = 0;
+    // Masked layout: bit g set when group g holds rows, so the walk visits only those groups
+    static constexpr uint32_t kMaxMaskedSkipGroups = 64;
+    uint64_t masked_nonempty_mask = 0;
     // Only used for contiguous psum layout
     uint32_t last_psum_m = 0, current_psum_m, current_m_block_cumsum = 0;
     // Only used for k-grouped layout
@@ -105,6 +108,18 @@ struct Scheduler {
             this->grouped_layout = grouped_layout;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             this->grouped_layout = grouped_layout;
+#ifdef DG_MASKED_SCHED_SKIP_EMPTY
+            // Every thread of the CTA builds the mask, one ballot per 32 groups
+            if constexpr (kNumGroups <= kMaxMaskedSkipGroups) {
+                #pragma unroll
+                for (uint32_t base_group_idx = 0; base_group_idx < kNumGroups; base_group_idx += 32) {
+                    const auto group_idx = base_group_idx + threadIdx.x % 32;
+                    const bool is_nonempty = group_idx < kNumGroups and grouped_layout[group_idx] > 0;
+                    const auto ballot = __ballot_sync(0xffffffffu, is_nonempty);
+                    masked_nonempty_mask |= static_cast<uint64_t>(ballot) << base_group_idx;
+                }
+            }
+#endif
         } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             this->grouped_layout = grouped_layout;
             current_psum_m = grouped_layout[0];
@@ -201,6 +216,18 @@ struct Scheduler {
                 // End of the task
                 if (current_group_idx == kNumGroups)
                     return false;
+
+#ifdef DG_MASKED_SCHED_SKIP_EMPTY
+                // Jump over empty groups, which hold no blocks
+                if constexpr (kNumGroups <= kMaxMaskedSkipGroups) {
+                    const auto remaining_mask = masked_nonempty_mask >> current_group_idx;
+                    if (remaining_mask == 0) {
+                        current_group_idx = kNumGroups;
+                        return false;
+                    }
+                    current_group_idx += __ffsll(static_cast<long long>(remaining_mask)) - 1;
+                }
+#endif
 
                 // Within current group
                 num_m_blocks = math::ceil_div(static_cast<uint32_t>(grouped_layout[current_group_idx]), BLOCK_M);

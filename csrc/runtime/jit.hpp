@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -27,6 +28,10 @@ inline void init_jit(const std::string& library_root_path) {
             emplace_back("--diag-suppress=39,161,174,177,186,940");
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
+        // Opt-in: masked grouped GEMMs walk only the groups that hold rows
+        if (const char* masked_skip_empty = std::getenv("DG_MASKED_SCHED_SKIP_EMPTY");
+            masked_skip_empty != nullptr and std::string(masked_skip_empty) == "1")
+            runtime->default_compiler_options.nvcc_flags->emplace_back("-DDG_MASKED_SCHED_SKIP_EMPTY");
         // Preserve the downstream family targets and explicit SM120 code generation.
         // DeepJIT requires CUDA 12.9+, where the family suffix is available.
         const auto major = runtime->device.get_arch_major();
