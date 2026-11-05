@@ -215,6 +215,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
+    // The fused SiLU-and-mul quant's dependent (the down GEMM) cannot share an SM with this kernel's CTAs,
+    // so letting it launch now only puts its CTAs and prologue on the SMs this kernel's CTAs leave
+    if constexpr (kWithSiluMulQuant)
+        cudaTriggerProgrammaticLaunchCompletion();
+
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4,
