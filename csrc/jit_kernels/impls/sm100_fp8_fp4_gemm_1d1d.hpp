@@ -25,6 +25,7 @@ public:
         // TODO: move into descriptor
         int gran_k_a, gran_k_b, k_alignment;
         bool use_padded_sf_layout = true;
+        int num_splits = 1;
 
         void* grouped_layout;
         CUtensorMap tensor_map_a;
@@ -65,7 +66,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {},
-        {}, {}
+        {}, {},
+        {}
     >);
 }};
 )",
@@ -85,7 +87,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         a_dtype, b_dtype, to_string(args.gemm_desc.cd_dtype),
-        args.epilogue.type, args.use_padded_sf_layout));
+        args.epilogue.type, args.use_padded_sf_layout,
+        args.num_splits));
 
         // Launch
         jit->launch(
@@ -168,6 +171,127 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_b = gran_k_b,
         // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
         .k_alignment = gran_k_a,
+        .grouped_layout = nullptr,
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+        .tensor_map_cd = tensor_map_cd
+    });
+}
+
+// Split-K over `num_splits` K slices on the CTAs of one cluster, reduced in the leader's shared memory
+// (see `EpilogueSplitKReduceBF16`) into the BF16 output `d`; every tile's cluster runs in one wave
+static void sm100_fp8_gemm_1d1d_split_k(const torch::Tensor& a, const torch::Tensor& sfa,
+                                        const torch::Tensor& b, const torch::Tensor& sfb,
+                                        const torch::Tensor& d,
+                                        const int& num_splits,
+                                        const int& m, const int& n, const int& k,
+                                        const int& gran_k_a, const int& gran_k_b,
+                                        const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                        const std::string& compiled_dims) {
+    constexpr int kNumScratchHeaderBytes = 16;
+    constexpr int kNumScratchAlignment = 1024;
+    constexpr int kMaxNumSplits = 4;
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::Normal,
+        .kernel_type = KernelType::Kernel1D1D,
+        .m = m, .n = n, .k = k, .num_groups = 1,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = major_a, .major_b = major_b,
+        .with_accumulation = false,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
+        .expected_num_groups = num_splits
+    };
+    desc.check_validity();
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
+    DG_HOST_ASSERT(compiled_dims.find('k') != std::string::npos);
+    DG_HOST_ASSERT(num_splits > 1 and num_splits <= kMaxNumSplits and k % (num_splits * 128 * 4) == 0);
+
+    // The swap-AB, single-CTA-MMA layouts whose tiles' clusters all fit in one wave
+    std::optional<Layout> best_layout;
+    std::optional<LayoutInfo> best_info;
+    for (const auto& candidate: SM100ArchSpec::get_layout_candidates(desc)) {
+        if (not candidate.swap_ab or candidate.get_cluster_size() != 1 or
+            ceil_div(m, candidate.block_m) * ceil_div(n, candidate.block_n) * num_splits > desc.num_sms)
+            continue;
+        const auto candidate_info = SM100ArchSpec::get_layout_info(desc, candidate);
+        if (not best_info.has_value() or SM100ArchSpec::compare(candidate_info, best_info.value()))
+            best_layout = candidate, best_info = candidate_info;
+    }
+    DG_HOST_ASSERT(best_layout.has_value());
+    const auto layout = best_layout.value();
+    const auto storage_config = SM100ArchSpec::get_storage_config(desc, layout);
+    // The leader's shared memory also holds the other slices' FP32 partials: give up the stages that pay for them
+    auto pipeline_config = SM100ArchSpec::get_pipeline_config(desc, layout, storage_config);
+    const int num_scratch_bytes = kNumScratchHeaderBytes + (num_splits - 1) * layout.block_n * layout.block_m * static_cast<int>(sizeof(float));
+    {
+        const int smem_extra_and_stages = pipeline_config.smem_size;
+        const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(
+            layout.block_m, layout.block_n, desc.get_mma_kind());
+        const int bytes_per_stage = (storage_config.load_block_m + storage_config.load_block_n) * layout.block_k +
+                                    (sf_block_m + sf_block_n) * layout.block_k / 32;
+        const int smem_extra = smem_extra_and_stages - pipeline_config.num_stages * bytes_per_stage;
+        const int smem_capacity = SM100ArchSpec::smem_capacity;
+        const int num_stages = std::min(pipeline_config.num_stages,
+                                        (smem_capacity - smem_extra - num_scratch_bytes - kNumScratchAlignment) / bytes_per_stage);
+        DG_HOST_ASSERT(num_stages >= 2);
+        pipeline_config.num_stages = num_stages;
+        pipeline_config.smem_size = smem_extra + num_stages * bytes_per_stage + kNumScratchAlignment + num_scratch_bytes;
+    }
+    const auto launch_config = SM100ArchSpec::get_launch_config(desc, layout);
+    const auto config = GemmConfig {
+        .layout = layout,
+        .storage_config = storage_config,
+        .pipeline_config = pipeline_config,
+        .launch_config = launch_config
+    };
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS"))
+        std::cout << "split-K " << num_splits << " " << desc << ": " << config << std::endl;
+    DG_HOST_ASSERT(launch_config.num_sms % num_splits == 0);
+    DG_HOST_ASSERT(ceil_div(m, layout.block_m) * ceil_div(n, layout.block_n) * num_splits <= launch_config.num_sms);
+
+    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                              config.storage_config.load_block_m,
+                                              config.layout.block_k,
+                                              static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                              config.storage_config.swizzle_a_mode, 0, false, not desc.is_mxf4_mma());
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                              config.storage_config.load_block_n,
+                                              config.layout.block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
+                                              config.storage_config.swizzle_b_mode, 0, false, not desc.is_mxf4_mma());
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, static_cast<int>(d.size(-1)),
+                                                config.storage_config.store_block_m,
+                                                config.storage_config.store_block_n,
+                                                static_cast<int>(d.stride(-2)), 1,
+                                                config.storage_config.swizzle_cd_mode);
+    const auto [sf_block_mn_a, sf_block_mn_b, sf_block_k] = get_sf_block_config(config, desc);
+    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                 sf_block_mn_a, gran_k_a, 1, 0, 0, false, sf_block_k);
+    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                 sf_block_mn_b, gran_k_b, 1, 0, 0, false, sf_block_k);
+
+    SM100FP8FP4Gemm1D1DRuntime::compile_and_launch("sm100_fp8_gemm_1d1d_split_k", {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(num_splits, 1, 1),
+        },
+        .epilogue = {"epilogue::transform::EpilogueSplitKReduceBF16",
+                     {.shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n),
+                      .act_out = d.data_ptr()}},
+        .gran_k_a = gran_k_a,
+        .gran_k_b = gran_k_b,
+        .k_alignment = gran_k_a,
+        .num_splits = num_splits,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

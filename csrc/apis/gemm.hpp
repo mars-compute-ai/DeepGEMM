@@ -226,6 +226,33 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     }
 }
 
+// `[M, K] @ [N, K].T` in `num_splits` K slices reduced inside the kernel (SM100, BF16 D)
+static void fp8_gemm_nt_split_k(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                const std::pair<torch::Tensor, torch::Tensor>& b,
+                                const torch::Tensor& d,
+                                const int& num_splits,
+                                std::optional<std::tuple<int, int, int>> recipe,
+                                const std::string& compiled_dims) {
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    check_major_type_cd(d);
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn and b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    if (m == 0)
+        return;
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and gran_k_a == 128 and gran_k_b == 128);
+    sm100_fp8_gemm_1d1d_split_k(a.first, sfa, b.first, sfb, d, num_splits, m, n, k,
+                                gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+}
+
 static void fp8_fp4_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::pair<torch::Tensor, torch::Tensor>& b,
                             const torch::Tensor& d,

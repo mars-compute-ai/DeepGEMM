@@ -81,4 +81,8 @@ struct EpilogueSiluMulQuantFP8: EpilogueIdentity {
     static constexpr uint32_t kGroupSize = 128;
 };
 
+// Split-K with the reduction inside the GEMM: the K slices of a tile run on the CTAs of one cluster,
+// and the leader sums their FP32 partials in slice order into `act_out`, the `[shape_m, shape_n]` BF16 D
+struct EpilogueSplitKReduceBF16: EpilogueIdentity {};
+
 } // namespace deep_gemm::epilogue::transform
