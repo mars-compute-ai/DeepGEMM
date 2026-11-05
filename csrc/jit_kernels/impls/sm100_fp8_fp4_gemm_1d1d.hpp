@@ -254,6 +254,9 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
     });
 }
 
+// Shared memory past the storage that the fused SiLU-and-mul quant epilogue reduces amax and synchronizes in
+static constexpr int kNumSiluMulQuantExtraSmemBytes = 1024;
+
 static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                      const torch::Tensor& b, const torch::Tensor& sfb,
                                                      const torch::Tensor& d,
@@ -262,7 +265,9 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                      const int& expected_m,
                                                      const int& gran_k_a, const int& gran_k_b,
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                     const std::string& compiled_dims) {
+                                                     const std::string& compiled_dims,
+                                                     const std::optional<torch::Tensor>& act_out = std::nullopt,
+                                                     const std::optional<torch::Tensor>& act_sf = std::nullopt) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedMasked,
         .kernel_type = KernelType::Kernel1D1D,
@@ -278,6 +283,27 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
+
+    // The fused SiLU-and-mul quant epilogue writes the FP8 activation and its SFs instead of D
+    // NOTES: it needs the swap-AB 2-CTA layout with multicast on A, 16 or 32 tokens per block,
+    //        and the N blocks of the gate and the up half sharing a cluster
+    const bool with_silu_mul_quant = act_out.has_value();
+    auto epilogue = make_epilogue_input(m, n);
+    auto num_smem_bytes = config.pipeline_config.smem_size;
+    if (with_silu_mul_quant) {
+        DG_HOST_ASSERT(act_sf.has_value());
+        DG_HOST_ASSERT(config.layout.swap_ab and config.layout.block_n == 128 and
+                       (config.layout.block_m == 16 or config.layout.block_m == 32) and
+                       config.layout.get_cluster_size() == 2 and config.layout.cluster_n > 1);
+        DG_HOST_ASSERT(compiled_dims.find('n') != std::string::npos and n % 512 == 0);
+        epilogue = {"epilogue::transform::EpilogueSiluMulQuantFP8",
+                    {.sfd = static_cast<uint32_t*>(act_sf->data_ptr()),
+                     .sfd_stride = static_cast<uint32_t>(act_sf->stride(-1)),
+                     .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n),
+                     .act_out = act_out->data_ptr()}};
+        num_smem_bytes += kNumSiluMulQuantExtraSmemBytes;
+        DG_HOST_ASSERT(num_smem_bytes <= SM100ArchSpec::smem_capacity);
+    }
 
     // Create tensor descriptors
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -306,11 +332,12 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gemm_desc = desc,
         .gemm_config = config,
         .options = {
-            .num_smem_bytes = config.pipeline_config.smem_size,
+            .num_smem_bytes = num_smem_bytes,
             .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
             .block_dim = dim3(config.launch_config.num_threads, 1, 1),
             .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
         },
+        .epilogue = epilogue,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         // NOTES: `k_alignment` is only used by k-grouped psum, dummy here

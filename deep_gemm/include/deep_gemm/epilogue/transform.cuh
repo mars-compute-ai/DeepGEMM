@@ -72,4 +72,13 @@ struct EpilogueDynamicScaledFP8: EpilogueIdentity {
     }
 };
 
+// SiLU-and-mul of the gate/up halves of a masked swap-AB GEMM, cast into FP8 with per-token,
+// per-128-column UE8M0 SFs: `act_out` is the `[G, shape_m, shape_n / 2]` FP8 activation and `sfd`
+// its SFs packed into `uint32_t` words, `[G, shape_n / 512, sfd_stride]` with tokens contiguous
+// NOTES: the 2 CTAs of a cluster take the gate and the up block of the same 128 columns; the
+//        arithmetic follows the BF16 D plus the standalone masked SiLU-and-mul quant bitwise
+struct EpilogueSiluMulQuantFP8: EpilogueIdentity {
+    static constexpr uint32_t kGroupSize = 128;
+};
+
 } // namespace deep_gemm::epilogue::transform

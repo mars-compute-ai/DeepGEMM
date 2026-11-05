@@ -12,6 +12,7 @@
 #include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
+#include <deep_gemm/epilogue/sm100_silu_mul_quant_swap_ab.cuh>
 #include <deep_gemm/layout/gemm.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -60,6 +61,13 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
     // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
     constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, epilogue::transform::EpilogueDynamicScaledFP8>;
+    // Fused SiLU-and-mul + FP8 quant: masked swap-AB with 2-CTA clusters taking a gate and an up block
+    constexpr bool kWithSiluMulQuant = cute::is_same_v<epilogue_op_t, epilogue::transform::EpilogueSiluMulQuantFP8>;
+    DG_STATIC_ASSERT(not kWithSiluMulQuant or (kGemmType == GemmType::MGroupedMasked and kSwapAB and
+                                               kNumMulticast == 2 and kIsMulticastOnA and (BLOCK_M == 16 or BLOCK_M == 32) and
+                                               BLOCK_N == 128 and SHAPE_N != 0 and SHAPE_N % (2 * 2 * BLOCK_N) == 0 and
+                                               cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
+                     "Invalid fused SiLU-and-mul quant config");
     DG_STATIC_ASSERT(kWithOutputSF ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
                                       kGemmType == GemmType::Batched and not kWithAccumulation) :
                                      (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
@@ -164,8 +172,21 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
     DG_STATIC_ASSERT(UMMA_A_SIZE_PER_STAGE <= sizeof(smem.a[0]) + sizeof(smem.b), "Memory out of bound for UMMA");
 
+    // Scratch of the fused SiLU-and-mul quant: the exchange over the C/D buffer, the rest past the shared storage
+    using silu_mul_quant_scratch_t = epilogue::SiluMulQuantScratch<kWithSiluMulQuant ? BLOCK_M / 2 : 8>;
+    const auto silu_mul_quant_scratch = silu_mul_quant_scratch_t(
+        smem.cd, smem_buffer + math::constexpr_align<uint32_t>(sizeof(SharedStorage), 16));
+    if constexpr (kWithSiluMulQuant) {
+        DG_STATIC_ASSERT(sizeof(typename silu_mul_quant_scratch_t::Exchange) <= sizeof(smem.cd), "Fused exchange exceeds the C/D buffer");
+        uint32_t num_dynamic_smem_bytes;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_dynamic_smem_bytes));
+        DG_TRAP_ONLY_DEVICE_ASSERT(math::constexpr_align<uint32_t>(sizeof(SharedStorage), 16) + sizeof(typename silu_mul_quant_scratch_t::Extra) <= num_dynamic_smem_bytes);
+    }
+
     // Initialize barriers
     if (warp_idx == 1 and cute::elect_one_sync()) {
+        if constexpr (kWithSiluMulQuant)
+            silu_mul_quant_scratch.init_barriers();
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             // Arrive at all CTAs
@@ -200,6 +221,14 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(), 1, kUsePaddedSFLayout, kWithAccumulation>(
         shape_m, shape_n, shape_k, grouped_layout);
 
+    // The fused SiLU-and-mul quant gives the 2 CTAs of a cluster the gate block j and the up block j + N / 2 / BLOCK_N
+    auto get_next_block = [&](uint32_t& next_m_block_idx, uint32_t& next_n_block_idx) -> bool {
+        const bool has_next = scheduler.get_next_block(next_m_block_idx, next_n_block_idx);
+        if constexpr (kWithSiluMulQuant)
+            next_n_block_idx = next_n_block_idx / 2 + (next_n_block_idx % 2) * (SHAPE_N / 2 / BLOCK_N);
+        return has_next;
+    };
+
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -217,7 +246,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                   LOAD_BLOCK_N * BLOCK_K / (kIsFP4B ? 2 : 1);
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (get_next_block(m_block_idx, n_block_idx)) {
             // Use dynamic load block M, when swap-AB is enabled
             const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
@@ -323,7 +352,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                          "Invalid MMA instruction shape");
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (get_next_block(m_block_idx, n_block_idx)) {
             // Wait until this accumulator stage is fully reusable.
             // The overlap barrier is deferred to the first K block so that
             // the SF UTCCP can be issued while the preceding epilogue drains.
@@ -488,7 +517,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (get_next_block(m_block_idx, n_block_idx)) {
             const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait SF TMA arrival
@@ -522,9 +551,10 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
+        uint32_t fused_tile_idx = 0;
 
         // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+        while (get_next_block(m_block_idx, n_block_idx)) {
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
@@ -542,7 +572,17 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             const auto base_n_idx = n_block_idx * BLOCK_N;
             const bool is_empty_group = is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0;
 
-            if constexpr (kSwapAB) {
+            if constexpr (kWithSiluMulQuant) {
+                DG_STATIC_ASSERT(kNumOverlappedTmemCols == 0 and kNumUMMAStoreThreads == 128, "Invalid fused epilogue");
+                epilogue::sm100_silu_mul_quant_swap_ab<BLOCK_M, BLOCK_N, SHAPE_N / 2>
+                (silu_mul_quant_scratch, fused_tile_idx ++, tmem_base_addr,
+                 scheduler.current_group_idx, m_block_idx,
+                 n_block_idx - cute::block_rank_in_cluster() * (SHAPE_N / 2 / BLOCK_N),
+                 shape_m, static_cast<uint32_t>(__ldg(grouped_layout + scheduler.current_group_idx)),
+                 epilogue_warp_idx, lane_idx,
+                 epilogue_op,
+                 &smem.tmem_empty_barriers[accum_stage_idx]);
+            } else if constexpr (kSwapAB) {
                 const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 epilogue::sm100_store_cd_swap_ab<
                     BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,

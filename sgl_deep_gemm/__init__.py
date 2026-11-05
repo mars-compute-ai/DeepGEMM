@@ -183,6 +183,11 @@ try:
         (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
+    def m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(a, b, act_out, act_sf, masked_m, expected_m, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False):
+        """Masked gate/up GEMM whose epilogue writes the SiLU-and-mul of its two N halves as FP8 with per-128 UE8M0 SFs."""
+        (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        return _C.m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(a, a_sf, b, b_sf, act_out, act_sf, masked_m, expected_m, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
+
     m_grouped_fp4_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked

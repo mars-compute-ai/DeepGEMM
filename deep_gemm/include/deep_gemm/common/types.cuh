@@ -81,6 +81,8 @@ struct EpilogueArgs {
     uint32_t sfd_stride = 0;
     uint32_t shape_m = 0, shape_n = 0;
     float alpha = 1.0f;
+    // FP8 activation output of `EpilogueSiluMulQuantFP8`
+    void* act_out = nullptr;
 };
 
 } // namespace deep_gemm

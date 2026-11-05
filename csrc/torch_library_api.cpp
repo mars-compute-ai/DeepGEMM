@@ -229,6 +229,18 @@ void dg_m_grouped_fp8_fp4_gemm_nt_masked(const Tensor& a, const Tensor& a_sf,
         compiled_dims, disable_ue8m0_cast);
 }
 
+void dg_m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(const Tensor& a, const Tensor& a_sf,
+                                                        const Tensor& b, const Tensor& b_sf,
+                                                        const Tensor& act_out, const Tensor& act_sf,
+                                                        const Tensor& masked_m, int64_t expected_m,
+                                                        at::OptionalIntArrayRef recipe_a,
+                                                        at::OptionalIntArrayRef recipe_b,
+                                                        const std::string& compiled_dims, bool disable_ue8m0_cast) {
+    gemm::m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(
+        {a, a_sf}, {b, b_sf}, act_out, act_sf, masked_m, static_cast<int>(expected_m),
+        to_optional_tuple2(recipe_a), to_optional_tuple2(recipe_b), compiled_dims, disable_ue8m0_cast);
+}
+
 #define DG_DEFINE_BF16_GEMM(name)                                                                  \
 void dg_##name(const Tensor& a, const Tensor& b, const Tensor& d, const OptTensor& c,              \
                const std::string& compiled_dims, std::optional<double> alpha) {                    \
@@ -718,6 +730,9 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("m_grouped_fp8_fp4_gemm_nt_masked(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, Tensor(a!) d, "
           "Tensor masked_m, int expected_m, int[]? recipe, int[]? recipe_a, int[]? recipe_b, str compiled_dims, "
           "bool disable_ue8m0_cast) -> ()");
+    m.def("m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(Tensor a, Tensor a_sf, Tensor b, Tensor b_sf, "
+          "Tensor(a!) act_out, Tensor(b!) act_sf, Tensor masked_m, int expected_m, int[]? recipe_a, int[]? recipe_b, "
+          "str compiled_dims, bool disable_ue8m0_cast) -> ()");
     m.def("bf16_gemm_nt" DG_BF16_GEMM_SCHEMA);
     m.def("bf16_gemm_nn" DG_BF16_GEMM_SCHEMA);
     m.def("bf16_gemm_tn" DG_BF16_GEMM_SCHEMA);
@@ -830,6 +845,7 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("m_grouped_fp8_fp4_gemm_nt_contiguous", &dg_m_grouped_fp8_fp4_gemm_nt_contiguous);
     m.impl("m_grouped_fp8_fp4_gemm_nn_contiguous", &dg_m_grouped_fp8_fp4_gemm_nn_contiguous);
     m.impl("m_grouped_fp8_fp4_gemm_nt_masked", &dg_m_grouped_fp8_fp4_gemm_nt_masked);
+    m.impl("m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant", &dg_m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant);
     m.impl("bf16_gemm_nt", &dg_bf16_gemm_nt);
     m.impl("bf16_gemm_nn", &dg_bf16_gemm_nn);
     m.impl("bf16_gemm_tn", &dg_bf16_gemm_tn);

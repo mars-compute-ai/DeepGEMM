@@ -416,6 +416,53 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     }
 }
 
+static void m_grouped_fp8_fp4_gemm_nt_masked_silu_mul_quant(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                            const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                            const torch::Tensor& act_out,
+                                                            const torch::Tensor& act_sf,
+                                                            const torch::Tensor& masked_m,
+                                                            const int& expected_m,
+                                                            std::optional<std::tuple<int, int>> recipe_a,
+                                                            std::optional<std::tuple<int, int>> recipe_b,
+                                                            const std::string& compiled_dims,
+                                                            const bool& disable_ue8m0_cast) {
+    // `[G, M, K] @ [G, N, K].mT` with the SiLU-and-mul of the two N halves cast into FP8 `[G, M, N / 2]`
+    // and its per-128 UE8M0 SFs, packed MN-major `[G, M, N / 512]` with tokens contiguous (SM100 only)
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_m.is_contiguous() and masked_m.scalar_type() == torch::kInt);
+
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    const auto [num_groups  , m , k ] = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [num_groups_ , n , k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [num_groups__, m_, n_half] = get_shape<3>(act_out);
+    const auto num_groups___ = static_cast<int>(masked_m.numel());
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
+    DG_HOST_ASSERT(m == m_ and n == 2 * n_half and k == k_ and n % 512 == 0);
+    DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(act_out.scalar_type() == torch::kFloat8_e4m3fn and act_out.is_contiguous());
+
+    // SFs: int32 `[G, M, N / 512]`, MN-major with a group stride covering M
+    const auto num_packed_sf = n_half / 128 / 4;
+    DG_HOST_ASSERT(act_sf.scalar_type() == torch::kInt and act_sf.dim() == 3);
+    DG_HOST_ASSERT(act_sf.size(0) == num_groups and act_sf.size(1) == m and act_sf.size(2) == num_packed_sf);
+    DG_HOST_ASSERT(act_sf.stride(1) == 1 and act_sf.stride(2) >= m and act_sf.stride(0) == act_sf.stride(2) * num_packed_sf);
+
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, num_groups, num_groups, disable_ue8m0_cast);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt);
+
+    // D is never written: its TMA descriptor only spans the activation's storage
+    const auto d = torch::from_blob(act_out.data_ptr(), {num_groups, m, n},
+                                    torch::TensorOptions().dtype(torch::kBFloat16).device(act_out.device()));
+    sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                             num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+                                             major_a, major_b, compiled_dims, act_out, act_sf);
+}
+
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                              const std::pair<torch::Tensor, torch::Tensor>& b,
                                              const torch::Tensor& d,
