@@ -28,7 +28,7 @@ struct SiluMulQuantScratch {
     struct Extra {
         // Per-warp amax of this CTA's tokens, as BF16 pairs
         uint4 warp_amax[kNumSlots][kNumThreads / 32][kNumPackedPerThread];
-        // Peer data landed, one barrier per slot, expecting every peer epilogue thread
+        // Peer data landed, one barrier per slot: one local arrival expecting the peer's bytes
         uint64_t exchange_full[kNumSlots];
     };
     DG_STATIC_ASSERT(sizeof(Extra) <= kNumExtraSmemBytes, "Fused scratch exceeds its shared memory");
@@ -50,27 +50,30 @@ struct SiluMulQuantScratch {
         #pragma unroll
         for (uint32_t i = 0; i < kNumSlots; ++ i) {
             const auto addr = static_cast<uint32_t>(__cvta_generic_to_shared(&extra->exchange_full[i]));
-            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(addr), "r"(kNumThreads));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(addr));
         }
     }
 
-    /// Store this thread's tokens into the peer's slot and arrive at the peer's barrier
+    /// Store this thread's tokens into the peer's slot, completing their bytes on the peer's barrier
     CUTLASS_DEVICE void send(const uint32_t& slot, const uint32_t& thread_idx, const uint32_t& peer_rank,
                              const uint4 (&values)[kNumPackedPerThread]) const {
+        const auto remote_barrier = to_cluster_addr(&extra->exchange_full[slot], peer_rank);
         #pragma unroll
         for (uint32_t i = 0; i < kNumPackedPerThread; ++ i) {
             const auto remote_data = to_cluster_addr(&exchange->data[slot][thread_idx][i], peer_rank);
-            asm volatile("st.shared::cluster.v4.b32 [%0], {%1, %2, %3, %4};"
-                         :: "r"(remote_data), "r"(values[i].x), "r"(values[i].y), "r"(values[i].z), "r"(values[i].w) : "memory");
+            asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                         :: "r"(remote_data), "r"(values[i].x), "r"(values[i].y), "r"(values[i].z), "r"(values[i].w),
+                            "r"(remote_barrier) : "memory");
         }
-        const auto remote_barrier = to_cluster_addr(&extra->exchange_full[slot], peer_rank);
-        asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" :: "r"(remote_barrier) : "memory");
     }
 
     /// Wait for the peer's tokens of this thread's row and read them
     CUTLASS_DEVICE void receive(const uint32_t& slot, const uint32_t& phase, const uint32_t& thread_idx,
                                 uint4 (&values)[kNumPackedPerThread]) const {
         const auto addr = static_cast<uint32_t>(__cvta_generic_to_shared(&extra->exchange_full[slot]));
+        if (thread_idx == 0)
+            asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                         :: "r"(addr), "r"(static_cast<uint32_t>(sizeof(Exchange) / kNumSlots)) : "memory");
         asm volatile(
             "{\n"
             ".reg .pred p;\n"
