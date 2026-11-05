@@ -212,8 +212,19 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     }
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
+    // A masked swap-AB GEMM that is the PDL dependent of the fused SiLU-and-mul quant streams its first
+    // stages of weights (B and SFB) before the grid-dependency wait: the weights are never written by the
+    // primary, and the masked layout was written by the dispatch that completed before the primary's wait
+#if defined(DG_MASKED_PDL_PREFETCH_B)
+    constexpr bool kPrefetchBBeforeWait = kGemmType == GemmType::MGroupedMasked and kSwapAB and
+                                          not kWithSiluMulQuant and kMajorB == cute::UMMA::Major::K;
+#else
+    constexpr bool kPrefetchBBeforeWait = false;
+#endif
+
     // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    if (not kPrefetchBBeforeWait or warp_idx != 0)
+        cudaGridDependencySynchronize();
 
     // The fused SiLU-and-mul quant's dependent (the down GEMM) cannot share an SM with this kernel's CTAs,
     // so letting it launch now only puts its CTAs and prologue on the SMs this kernel's CTAs leave
@@ -250,88 +261,117 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         constexpr uint32_t kNumTMABytesPerStage = LOAD_BLOCK_M * BLOCK_K / (kIsFP4A ? 2 : 1) +
                                                   LOAD_BLOCK_N * BLOCK_K / (kIsFP4B ? 2 : 1);
 
-        // Persistently schedule over blocks
-        while (get_next_block(m_block_idx, n_block_idx)) {
+        // Issue one stage of the current block: the A side (A, SFA), the B side (B, SFB), or both;
+        // the stage's barriers take their single arrival, with every byte of the stage, with the B side
+        auto issue_stage = [&](const uint32_t& stage, const uint32_t& k_block_idx,
+                               const bool& do_issue_a, const bool& do_issue_b) {
             // Use dynamic load block M, when swap-AB is enabled
             const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
+            // Compute offsets
+            // M-grouped masked A stores groups along M; contiguous A uses global M.
+            constexpr bool kAWithGroupMNOffset = kGemmType == GemmType::MGroupedMasked;
+            uint32_t m_idx = scheduler.template get_global_idx<kAWithGroupMNOffset, sched::IndexType::MN> (
+                shape_m, BLOCK_M, m_block_idx);
+            // M-grouped K-major B stores groups along N.
+            constexpr bool kBWithGroupMNOffset = (kMajorB == cute::UMMA::Major::K) and
+                                                 (is_m_grouped_contiguous(kGemmType) or kGemmType == GemmType::MGroupedMasked);
+            uint32_t n_idx = scheduler.template get_global_idx<kBWithGroupMNOffset, sched::IndexType::MN> (
+                shape_n, BLOCK_N, n_block_idx, m_block_idx);
+
+            DG_STATIC_ASSERT(kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
+                             kMajorA == cute::UMMA::Major::K, "Invalid major");
+            // K-grouped A uses a shared K arena; other MN-major A groups along K.
+            constexpr bool kAWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorA == cute::UMMA::Major::MN);
+            // K-grouped B uses a shared K arena; M-grouped MN-major B groups along K.
+            constexpr bool kBWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorB == cute::UMMA::Major::MN);
+            uint32_t k_a_idx = scheduler.template get_global_idx<kAWithGroupKOffset, sched::IndexType::K> (
+                shape_k, BLOCK_K, k_block_idx, m_block_idx);
+            uint32_t k_b_idx = scheduler.template get_global_idx<kBWithGroupKOffset, sched::IndexType::K> (
+                shape_k, BLOCK_K, k_block_idx, m_block_idx);
+
+            // Add 2 CTA offsets
+            if constexpr (kNumMulticast > 1) {
+                m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * load_block_m) : 0;
+                n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
+            }
+
+            constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
+            const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
+
+            // Issue SFA and SFB TMAs first, so that the transpose can overlap the A/B transfer.
+            // No swizzling, so one TMA for one SF block is enough. SF loads land on their own barrier.
+            uint32_t sf_arrival_bytes = 0;
+            if (k_block_idx % kNumSFAStagesPerLoad == 0) {
+                if (do_issue_a) {
+                    uint32_t sfa_m_idx = m_block_idx * BLOCK_M;
+                    uint32_t sfa_k_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::SF_K>(
+                        shape_sfa_k, SF_BLOCK_K, k_block_idx / kNumSFAStagesPerLoad);
+                    tma::copy<SF_BLOCK_M, SF_BLOCK_K, 0>(&tensor_map_sfa, &smem.sf_full_barriers[stage], smem.sfa[stage], sfa_m_idx, sfa_k_idx);
+                }
+                sf_arrival_bytes += sizeof(smem.sfa[0]);
+            }
+            if (k_block_idx % kNumSFBStagesPerLoad == 0) {
+                if (do_issue_b) {
+                    uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                    uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(
+                        shape_sfb_k, SF_BLOCK_K, k_block_idx / kNumSFBStagesPerLoad, m_block_idx);
+                    tma::copy<SF_BLOCK_N, SF_BLOCK_K, 0>(&tensor_map_sfb, &smem.sf_full_barriers[stage], smem.sfb[stage], sfb_n_idx, sfb_k_idx);
+                }
+                sf_arrival_bytes += sizeof(smem.sfb[0]);
+            }
+            if (do_issue_b)
+                smem.sf_full_barriers[stage].arrive_and_expect_tx(sf_arrival_bytes);
+
+            // Issue A/B TMAs
+            if (do_issue_a) {
+                if constexpr (kMajorA == cute::UMMA::Major::K)
+                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
+                        &tensor_map_a, &smem.full_barriers[stage], smem.a[stage], k_a_idx, m_idx, kNumMulticast, batch_idx);
+                if constexpr (kMajorA == cute::UMMA::Major::MN)
+                    tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
+                        &tensor_map_a, &smem.full_barriers[stage], smem.a[stage], m_idx, k_a_idx, kNumMulticast, batch_idx);
+            }
+            if (do_issue_b) {
+                if constexpr (kMajorB == cute::UMMA::Major::K)
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
+                        &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], k_b_idx, n_idx, kNumMulticast, batch_idx);
+                if constexpr (kMajorB == cute::UMMA::Major::MN)
+                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
+                        &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], n_idx, k_b_idx, kNumMulticast, batch_idx);
+
+                // Arrive at full barriers
+                if (is_leader_cta) {
+                    smem.full_barriers[stage].arrive_and_expect_tx(kNumTMABytesPerStage * kNumMulticast);
+                } else {
+                    smem.full_barriers[stage].arrive(0u);
+                }
+            }
+        };
+
+        // The first block's leading stages of weights, before the grid-dependency wait
+        uint32_t num_prefetched_k_blocks = 0;
+        bool has_next_block = get_next_block(m_block_idx, n_block_idx);
+        if constexpr (kPrefetchBBeforeWait) {
+            if (has_next_block) {
+                const auto num_first_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
+                num_prefetched_k_blocks = cute::min(kNumStages, num_first_k_blocks);
+                for (uint32_t k_block_idx = 0; k_block_idx < num_prefetched_k_blocks; ++ k_block_idx)
+                    issue_stage(k_block_idx, k_block_idx, false, true);
+            }
+            cudaGridDependencySynchronize();
+        }
+
+        // Persistently schedule over blocks
+        for (; has_next_block; has_next_block = get_next_block(m_block_idx, n_block_idx)) {
             // For k-grouped layout, the number of block K is variable
             const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 smem.empty_barriers[stage_idx].wait(phase ^ 1);
-
-                // Compute offsets
-                // M-grouped masked A stores groups along M; contiguous A uses global M.
-                constexpr bool kAWithGroupMNOffset = kGemmType == GemmType::MGroupedMasked;
-                uint32_t m_idx = scheduler.template get_global_idx<kAWithGroupMNOffset, sched::IndexType::MN> (
-                    shape_m, BLOCK_M, m_block_idx);
-                // M-grouped K-major B stores groups along N.
-                constexpr bool kBWithGroupMNOffset = (kMajorB == cute::UMMA::Major::K) and
-                                                     (is_m_grouped_contiguous(kGemmType) or kGemmType == GemmType::MGroupedMasked);
-                uint32_t n_idx = scheduler.template get_global_idx<kBWithGroupMNOffset, sched::IndexType::MN> (
-                    shape_n, BLOCK_N, n_block_idx, m_block_idx);
-
-                DG_STATIC_ASSERT(kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
-                                 kMajorA == cute::UMMA::Major::K, "Invalid major");
-                // K-grouped A uses a shared K arena; other MN-major A groups along K.
-                constexpr bool kAWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorA == cute::UMMA::Major::MN);
-                // K-grouped B uses a shared K arena; M-grouped MN-major B groups along K.
-                constexpr bool kBWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorB == cute::UMMA::Major::MN);
-                uint32_t k_a_idx = scheduler.template get_global_idx<kAWithGroupKOffset, sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
-                uint32_t k_b_idx = scheduler.template get_global_idx<kBWithGroupKOffset, sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
-
-                // Add 2 CTA offsets
-                if constexpr (kNumMulticast > 1) {
-                    m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * load_block_m) : 0;
-                    n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
-                }
-
-                constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
-                const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
-
-                // Issue SFA and SFB TMAs first, so that the transpose can overlap the A/B transfer.
-                // No swizzling, so one TMA for one SF block is enough. SF loads land on their own barrier.
-                uint32_t sf_arrival_bytes = 0;
-                if (k_block_idx % kNumSFAStagesPerLoad == 0) {
-                    uint32_t sfa_m_idx = m_block_idx * BLOCK_M;
-                    uint32_t sfa_k_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::SF_K>(
-                        shape_sfa_k, SF_BLOCK_K, k_block_idx / kNumSFAStagesPerLoad);
-                    tma::copy<SF_BLOCK_M, SF_BLOCK_K, 0>(&tensor_map_sfa, &smem.sf_full_barriers[stage_idx], smem.sfa[stage_idx], sfa_m_idx, sfa_k_idx);
-                    sf_arrival_bytes += sizeof(smem.sfa[0]);
-                }
-                if (k_block_idx % kNumSFBStagesPerLoad == 0) {
-                    uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                    uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(
-                        shape_sfb_k, SF_BLOCK_K, k_block_idx / kNumSFBStagesPerLoad, m_block_idx);
-                    tma::copy<SF_BLOCK_N, SF_BLOCK_K, 0>(&tensor_map_sfb, &smem.sf_full_barriers[stage_idx], smem.sfb[stage_idx], sfb_n_idx, sfb_k_idx);
-                    sf_arrival_bytes += sizeof(smem.sfb[0]);
-                }
-                smem.sf_full_barriers[stage_idx].arrive_and_expect_tx(sf_arrival_bytes);
-
-                // Issue A/B TMAs
-                if constexpr (kMajorA == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], k_a_idx, m_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorA == cute::UMMA::Major::MN)
-                    tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
-                        &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorB == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], k_b_idx, n_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorB == cute::UMMA::Major::MN)
-                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);
-
-                // Arrive at full barriers
-                if (is_leader_cta) {
-                    smem.full_barriers[stage_idx].arrive_and_expect_tx(kNumTMABytesPerStage * kNumMulticast);
-                } else {
-                    smem.full_barriers[stage_idx].arrive(0u);
-                }
+                issue_stage(stage_idx, k_block_idx, true, k_block_idx >= num_prefetched_k_blocks);
             }
+            num_prefetched_k_blocks = 0;
         }
     } else if (warp_idx == 1 and is_leader_cta) {
         // MMA issue warp
