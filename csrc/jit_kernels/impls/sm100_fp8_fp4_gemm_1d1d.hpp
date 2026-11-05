@@ -39,7 +39,13 @@ public:
         //        Both share the same kernel template and only differ in the operand dtype strings.
         const auto a_dtype = to_string(args.gemm_desc.a_dtype, not args.gemm_desc.is_mxf4_mma());
         const auto b_dtype = to_string(args.gemm_desc.b_dtype, not args.gemm_desc.is_mxf4_mma());
-        const auto kernel = jit->compile(tag, std::format(R"(
+        // Opt-in, read at each call: the masked GEMM launched while DG_MASKED_PDL_PREFETCH_B=1 streams its
+        // first weight stages before its grid-dependency wait (the caller sets it only for a PDL dependent
+        // whose primary was itself launched after the masked layout was written)
+        const char* masked_pdl_prefetch_b = std::getenv("DG_MASKED_PDL_PREFETCH_B");
+        const bool do_prefetch_b = args.gemm_desc.gemm_type == GemmType::MGroupedMasked and
+                                   masked_pdl_prefetch_b != nullptr and std::string(masked_pdl_prefetch_b) == "1";
+        const auto kernel = jit->compile(tag, std::format(R"({}
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -63,6 +69,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        do_prefetch_b ? "\n#define DG_MASKED_PDL_PREFETCH_B" : "",
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         args.gran_k_a, args.gran_k_b, args.k_alignment,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
