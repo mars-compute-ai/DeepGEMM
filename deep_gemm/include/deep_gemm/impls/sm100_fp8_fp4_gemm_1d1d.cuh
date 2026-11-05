@@ -13,6 +13,7 @@
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/epilogue/sm100_silu_mul_quant_swap_ab.cuh>
+#include <deep_gemm/epilogue/sm100_split_k_reduce_swap_ab.cuh>
 #include <deep_gemm/layout/gemm.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -35,7 +36,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_op_t, bool kUsePaddedSFLayout = true>
+          typename epilogue_op_t, bool kUsePaddedSFLayout = true,
+          uint32_t kNumSplits = 1>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -68,6 +70,14 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                                                BLOCK_N == 128 and SHAPE_N != 0 and SHAPE_N % (2 * 2 * BLOCK_N) == 0 and
                                                cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
                      "Invalid fused SiLU-and-mul quant config");
+    // Split-K reduced inside the kernel: each scheduled block takes one K slice of one tile
+    constexpr bool kWithSplitKReduce = cute::is_same_v<epilogue_op_t, epilogue::transform::EpilogueSplitKReduceBF16>;
+    DG_STATIC_ASSERT(kWithSplitKReduce == (kNumSplits > 1), "Split-K requires the split-K reduce epilogue");
+    DG_STATIC_ASSERT(not kWithSplitKReduce or (kGemmType == GemmType::Normal and kSwapAB and kNumMulticast == 1 and kNumSMs % kNumSplits == 0 and
+                                               not kWithAccumulation and SHAPE_K != 0 and SHAPE_K % (kNumSplits * BLOCK_K * 4) == 0 and
+                                               cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
+                     "Invalid split-K reduce config");
+    constexpr uint32_t kNumKBlocksPerSplit = kWithSplitKReduce ? SHAPE_K / BLOCK_K / kNumSplits : 0;
     DG_STATIC_ASSERT(kWithOutputSF ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
                                       kGemmType == GemmType::Batched and not kWithAccumulation) :
                                      (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
@@ -143,7 +153,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
 
     // Utils
-    const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+    const bool is_leader_cta = kNumMulticast == 1 or cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = ptx::get_lane_idx();
 
@@ -183,10 +193,21 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         DG_TRAP_ONLY_DEVICE_ASSERT(math::constexpr_align<uint32_t>(sizeof(SharedStorage), 16) + sizeof(typename silu_mul_quant_scratch_t::Extra) <= num_dynamic_smem_bytes);
     }
 
+    // Scratch of the split-K reduction, past the shared storage of the leader CTA
+    using split_k_scratch_t = epilogue::SplitKReduceScratch<BLOCK_M, cute::max(kNumSplits, 2u), kNumEpilogueThreads>;
+    const auto split_k_scratch = split_k_scratch_t(smem_buffer + math::constexpr_align<uint32_t>(sizeof(SharedStorage), 16));
+    if constexpr (kWithSplitKReduce) {
+        uint32_t num_dynamic_smem_bytes;
+        asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_dynamic_smem_bytes));
+        DG_TRAP_ONLY_DEVICE_ASSERT(math::constexpr_align<uint32_t>(sizeof(SharedStorage), 16) + sizeof(typename split_k_scratch_t::Storage) <= num_dynamic_smem_bytes);
+    }
+
     // Initialize barriers
     if (warp_idx == 1 and cute::elect_one_sync()) {
         if constexpr (kWithSiluMulQuant)
             silu_mul_quant_scratch.init_barriers();
+        if constexpr (kWithSplitKReduce)
+            split_k_scratch.init_barrier();
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             // Arrive at all CTAs
@@ -210,7 +231,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, &smem.tmem_ptr);
     }
-    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+    (kNumMulticast > 1 or kWithSplitKReduce) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -223,7 +244,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4,
-        sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(), 1, kUsePaddedSFLayout, kWithAccumulation>(
+        sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>(), kNumSplits, kUsePaddedSFLayout, kWithAccumulation>(
         shape_m, shape_n, shape_k, grouped_layout);
 
     // The fused SiLU-and-mul quant gives the 2 CTAs of a cluster the gate block j and the up block j + N / 2 / BLOCK_N
@@ -256,7 +277,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
             // For k-grouped layout, the number of block K is variable
-            const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
+            const auto num_total_k_blocks = kWithSplitKReduce ? kNumKBlocksPerSplit : cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 smem.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -278,10 +299,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 constexpr bool kAWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorA == cute::UMMA::Major::MN);
                 // K-grouped B uses a shared K arena; M-grouped MN-major B groups along K.
                 constexpr bool kBWithGroupKOffset = is_k_grouped_contiguous(kGemmType) or (kMajorB == cute::UMMA::Major::MN);
+                const uint32_t global_k_block_idx = k_block_idx + (kWithSplitKReduce ? scheduler.split_k_idx * kNumKBlocksPerSplit : 0);
                 uint32_t k_a_idx = scheduler.template get_global_idx<kAWithGroupKOffset, sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    shape_k, BLOCK_K, global_k_block_idx, m_block_idx);
                 uint32_t k_b_idx = scheduler.template get_global_idx<kBWithGroupKOffset, sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    shape_k, BLOCK_K, global_k_block_idx, m_block_idx);
 
                 // Add 2 CTA offsets
                 if constexpr (kNumMulticast > 1) {
@@ -298,14 +320,14 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 if (k_block_idx % kNumSFAStagesPerLoad == 0) {
                     uint32_t sfa_m_idx = m_block_idx * BLOCK_M;
                     uint32_t sfa_k_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::SF_K>(
-                        shape_sfa_k, SF_BLOCK_K, k_block_idx / kNumSFAStagesPerLoad);
+                        shape_sfa_k, SF_BLOCK_K, global_k_block_idx / kNumSFAStagesPerLoad);
                     tma::copy<SF_BLOCK_M, SF_BLOCK_K, 0>(&tensor_map_sfa, &smem.sf_full_barriers[stage_idx], smem.sfa[stage_idx], sfa_m_idx, sfa_k_idx);
                     sf_arrival_bytes += sizeof(smem.sfa[0]);
                 }
                 if (k_block_idx % kNumSFBStagesPerLoad == 0) {
                     uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                     uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(
-                        shape_sfb_k, SF_BLOCK_K, k_block_idx / kNumSFBStagesPerLoad, m_block_idx);
+                        shape_sfb_k, SF_BLOCK_K, global_k_block_idx / kNumSFBStagesPerLoad, m_block_idx);
                     tma::copy<SF_BLOCK_N, SF_BLOCK_K, 0>(&tensor_map_sfb, &smem.sf_full_barriers[stage_idx], smem.sfb[stage_idx], sfb_n_idx, sfb_k_idx);
                     sf_arrival_bytes += sizeof(smem.sfb[0]);
                 }
@@ -391,7 +413,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             }
 
             // Launch MMAs
-            const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
+            const auto num_total_k_blocks = kWithSplitKReduce ? kNumKBlocksPerSplit : cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             #pragma unroll 4
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
@@ -523,7 +545,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         };
 
         while (get_next_block(m_block_idx, n_block_idx)) {
-            const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
+            const auto num_total_k_blocks = kWithSplitKReduce ? kNumKBlocksPerSplit : cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait SF TMA arrival
                 smem.sf_full_barriers[stage_idx].wait(phase);
@@ -542,7 +564,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 // TODO: figure out whether the proxy fence is valid for 2-CTA cases
                 cutlass::arch::fence_view_async_shared();
 
-                smem.full_barriers[stage_idx].arrive(0u);
+                // Arrive at the leader CTA of the MMA, which is every CTA of a split-K cluster
+                kWithSplitKReduce ? smem.full_barriers[stage_idx].arrive() : smem.full_barriers[stage_idx].arrive(0u);
             }
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
@@ -584,6 +607,14 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                  scheduler.current_group_idx, m_block_idx,
                  n_block_idx - cute::block_rank_in_cluster() * (SHAPE_N / 2 / BLOCK_N),
                  shape_m, static_cast<uint32_t>(__ldg(grouped_layout + scheduler.current_group_idx)),
+                 epilogue_warp_idx, lane_idx,
+                 epilogue_op,
+                 &smem.tmem_empty_barriers[accum_stage_idx]);
+            } else if constexpr (kWithSplitKReduce) {
+                DG_STATIC_ASSERT(kNumOverlappedTmemCols == 0, "Split-K reduce reads the whole accumulator at once");
+                epilogue::sm100_split_k_reduce_swap_ab<BLOCK_M, BLOCK_N, kNumSplits, kNumUMMAStoreThreads>
+                (split_k_scratch, tmem_base_addr, base_m_idx, base_n_idx, scheduler.split_k_idx,
+                 shape_m, shape_n,
                  epilogue_warp_idx, lane_idx,
                  epilogue_op,
                  &smem.tmem_empty_barriers[accum_stage_idx]);

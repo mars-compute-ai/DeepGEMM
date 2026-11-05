@@ -148,6 +148,10 @@ try:
         d_data, d_sf = d if isinstance(d, (tuple, list)) else (d, None)
         _C.fp8_einsum(expr, a_data, a_sf, b_data, b_sf, d_data, d_sf, c, recipe)
 
+    def fp8_gemm_nt_split_k(a, b, d, num_splits, recipe=None, compiled_dims='nk'):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.fp8_gemm_nt_split_k(a_data, a_sf, b_data, b_sf, d, num_splits, recipe, compiled_dims)
+
     def fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, recipe=None, compiled_dims='nk', disable_ue8m0_cast=False):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         _C.fp8_gemm_nt_skip_head_mid(a_data, a_sf, b_data, b_sf, d, head_splits, recipe, compiled_dims, disable_ue8m0_cast)

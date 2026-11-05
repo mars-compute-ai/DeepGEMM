@@ -353,6 +353,14 @@ void dg_tf32_hc_prenorm_gemm(const Tensor& a, const Tensor& b, const Tensor& d,
 // ---------------------------------------------------------------------------
 // Attention
 // ---------------------------------------------------------------------------
+void dg_fp8_gemm_nt_split_k(const Tensor& a_data, const Tensor& a_sf,
+                            const Tensor& b_data, const Tensor& b_sf,
+                            const Tensor& d, int64_t num_splits,
+                            at::OptionalIntArrayRef recipe, const std::string& compiled_dims) {
+    gemm::fp8_gemm_nt_split_k({a_data, a_sf}, {b_data, b_sf}, d, static_cast<int>(num_splits),
+                              to_optional_tuple3(recipe), compiled_dims);
+}
+
 void dg_fp8_gemm_nt_skip_head_mid(const Tensor& a_data, const Tensor& a_sf,
                                   const Tensor& b_data, const Tensor& b_sf,
                                   const Tensor& d, at::IntArrayRef head_splits,
@@ -759,6 +767,8 @@ TORCH_LIBRARY(deep_gemm, m) {
     m.def("tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(a!) d, Tensor(b!) sqr_sum, int? num_splits) -> ()");
 
     // Attention
+    m.def("fp8_gemm_nt_split_k(Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, Tensor(a!) d, "
+          "int num_splits, int[]? recipe, str compiled_dims) -> ()");
     m.def("fp8_gemm_nt_skip_head_mid(Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, Tensor(a!) d, "
           "int[] head_splits, int[]? recipe, str compiled_dims, bool disable_ue8m0_cast) -> ()");
     m.def("fp8_mqa_logits(Tensor q, Tensor kv_data, Tensor kv_sf, Tensor weights, Tensor cu_seq_len_k_start, "
@@ -864,6 +874,7 @@ TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
     m.impl("fp8_einsum", &dg_fp8_einsum);
     m.impl("tf32_hc_prenorm_gemm", &dg_tf32_hc_prenorm_gemm);
 
+    m.impl("fp8_gemm_nt_split_k", &dg_fp8_gemm_nt_split_k);
     m.impl("fp8_gemm_nt_skip_head_mid", &dg_fp8_gemm_nt_skip_head_mid);
     m.impl("fp8_mqa_logits", &dg_fp8_mqa_logits);
     m.impl("get_paged_mqa_logits_metadata", &dg_get_paged_mqa_logits_metadata);

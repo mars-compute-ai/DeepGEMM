@@ -307,8 +307,9 @@ struct Scheduler {
 
             uint32_t mn_block_idx;
             if constexpr (kSplitKFactor > 1) {
-                mn_block_idx = next_block_idx % num_mn_blocks;
-                split_k_idx = next_block_idx / num_mn_blocks;
+                // Consecutive blocks take the K slices of one tile, so a cluster of kSplitKFactor CTAs shares it
+                mn_block_idx = next_block_idx / kSplitKFactor;
+                split_k_idx = next_block_idx % kSplitKFactor;
             } else {
                 mn_block_idx = next_block_idx;
                 split_k_idx = 0;
