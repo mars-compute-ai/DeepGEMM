@@ -282,6 +282,15 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         constexpr uint32_t kNumTMABytesPerStage = LOAD_BLOCK_M * BLOCK_K / (kIsFP4A ? 2 : 1) +
                                                   LOAD_BLOCK_N * BLOCK_K / (kIsFP4B ? 2 : 1);
 
+        // Masked weights are read once per call: DG_MASKED_B_EVICT_FIRST loads them with an evict-first L2 policy
+        // so the reused scales, activations and outputs stay in L2
+#if defined(DG_MASKED_B_EVICT_FIRST)
+        constexpr uint64_t kBCacheHint = static_cast<uint64_t>(kGemmType == GemmType::MGroupedMasked ?
+            cute::TMA::CacheHintSm100::EVICT_FIRST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
+#else
+        constexpr uint64_t kBCacheHint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+#endif
+
         // Issue one stage of the current block: the A side (A, SFA), the B side (B, SFB), or both;
         // the stage's barriers take their single arrival, with every byte of the stage, with the B side
         auto issue_stage = [&](const uint32_t& stage, const uint32_t& k_block_idx,
@@ -357,7 +366,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             if (do_issue_b) {
                 if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], k_b_idx, n_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], k_b_idx, n_idx, kNumMulticast, batch_idx, kBCacheHint);
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], n_idx, k_b_idx, kNumMulticast, batch_idx);

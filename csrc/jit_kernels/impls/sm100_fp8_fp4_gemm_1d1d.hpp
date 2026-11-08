@@ -46,7 +46,11 @@ public:
         const char* masked_pdl_prefetch_b = std::getenv("DG_MASKED_PDL_PREFETCH_B");
         const bool do_prefetch_b = args.gemm_desc.gemm_type == GemmType::MGroupedMasked and
                                    masked_pdl_prefetch_b != nullptr and std::string(masked_pdl_prefetch_b) == "1";
-        const auto kernel = jit->compile(tag, std::format(R"({}
+        // Opt-in, read at each call: a masked GEMM launched while DG_MASKED_B_EVICT_FIRST=1 loads its weights evict-first
+        const char* masked_b_evict_first = std::getenv("DG_MASKED_B_EVICT_FIRST");
+        const bool do_b_evict_first = args.gemm_desc.gemm_type == GemmType::MGroupedMasked and
+                                      masked_b_evict_first != nullptr and std::string(masked_b_evict_first) == "1";
+        const auto kernel = jit->compile(tag, std::format(R"({}{}
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -72,6 +76,7 @@ static void __instantiate_kernel() {{
 }};
 )",
         do_prefetch_b ? "\n#define DG_MASKED_PDL_PREFETCH_B" : "",
+        do_b_evict_first ? "\n#define DG_MASKED_B_EVICT_FIRST" : "",
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         args.gran_k_a, args.gran_k_b, args.k_alignment,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
